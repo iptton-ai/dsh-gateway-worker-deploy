@@ -23,5 +23,7 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Registry"] }],
 
+  "routes": [{ "pattern": "dsh.pan2017.cn", "custom_domain": true }],
+
   "observability": { "enabled": true }
 }
