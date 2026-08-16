@@ -310,9 +310,20 @@ async function adminRevokeToken(request: Request, env: Env): Promise<Response> {
   return json({ revoked });
 }
 
+/** 设备清单加 connected 近似(Rust 版按 WS 在场判定;CF 形态 WS 逐帧直通
+ *  不过 Worker,以「5 分钟内有中转活动」近似 —— 手机端轮询/心跳会刷新
+ *  last_used_at)。 */
+function withConnected(rows: Awaited<ReturnType<Registry["tokens"]>>) {
+  const cutoff = nowSec() - 300;
+  return rows.map((t) => ({
+    ...t,
+    connected: !t.revoked && t.last_used_at !== null && t.last_used_at > cutoff,
+  }));
+}
+
 async function adminTokens(request: Request, env: Env): Promise<Response> {
   if (!(await adminAuthed(request, env))) return err(401, "Unauthorized");
-  return json(await registry(env).tokens());
+  return json(withConnected(await registry(env).tokens()));
 }
 
 async function adminQr(request: Request, env: Env): Promise<Response> {
@@ -553,7 +564,7 @@ export default {
     const authed = await authenticate(request, env);
     if (authed instanceof Response) return authed;
     if (request.method === "GET" && path === "/auth/devices") {
-      return json(await registry(env).tokens());
+      return json(withConnected(await registry(env).tokens()));
     }
     if (request.method === "POST" && path === "/auth/revoke") {
       const body = await readJson<{ jti: string }>(request);
