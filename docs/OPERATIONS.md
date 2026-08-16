@@ -71,15 +71,24 @@ config.yml 不用手写 —— 插件每次随 dsh web 启动按运行时端口�
   1. [Zero Trust](https://one.dash.cloudflare.com/) → Access → **Service Tokens → Create**(Secret 只显示一次);
   2. ID 填 Worker var `CF_ACCESS_CLIENT_ID`,SECRET 用 `secret put`/dashboard 填入;
   3. Access → **Applications → Add → Self-hosted**:域名 = 隧道主机名;策略 Action = **Service Auth**,Include = 该 token。
-- CLI(🔑**TOKEN**,权限要齐:**Access: Apps and Policies Edit + Access: Service Tokens Read**(建策略要读 token 清单拿 UUID;只给 Edit 不够,实测会卡在列表)):
+- CLI(🔑**TOKEN**,权限:**Access: Apps and Policies Edit**即可建应用;
+  Service Tokens Read 仅在要按 UUID 精确引用时需要)。实测坑(2026-08):
+  ①旧端点 `cfd_access_service_tokens` 已下线(7003),读清单用
+  **`/accounts/{id}/access/service_tokens`**;
+  ②type 必须写 `self_hosted`(下划线);③Service Auth 策略 decision 写
+  **`non_identity`**;④按 UUID 引用(`{"service_token":{"id":…}}` 及字符串形式)
+  会被拒「invalid service_token rule」——实测可用的是
+  **`{"any_valid_service_token":{}}`**(匹配账户内任意有效 service token,
+  个人账户只有一枚时语义等价);⑤验证:无凭证 curl 直连隧道 = **403**
+  (浏览器才是 302),`healthz` 的 `upstream:true` = Worker 带凭证穿透成功:
   ```bash
-  # 拿 service token UUID
-  curl -s "$API/accounts/$ACC/cfd_access_service_tokens" -H "Authorization: Bearer $CFUT"
-  # 建应用(策略内联)
+  # (可选)读 service token 清单(client_id 是 <hex>.access 形态,与 UUID 无关)
+  curl -s "$API/accounts/$ACC/access/service_tokens" -H "Authorization: Bearer $CFUT"
+  # 建应用(策略内联,实测可用的 include 形式)
   curl -s -X POST "$API/accounts/$ACC/access/apps" -H "Authorization: Bearer $CFUT" \
-    -H 'content-type: application/json' -d '{"name":"dsh-gateway tunnel","type":"selfhosted",
+    -H 'content-type: application/json' -d '{"name":"dsh-gateway tunnel","type":"self_hosted",
       "domain":"<隧道主机名>","policies":[{"name":"allow-gateway-worker","precedence":1,
-      "decision":"service_auth","include":[{"service_token":{"id":"<UUID>"}}]}]}'
+      "decision":"non_identity","include":[{"any_valid_service_token":{}}]}]}'
   ```
 - 验证:`curl -sI https://<隧道主机名>/` → **302**(被 Access 拦 = 门装好了);
   `curl https://<网关域名>/healthz` → `"access_protected":true`。
