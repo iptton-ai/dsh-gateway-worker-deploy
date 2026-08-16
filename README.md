@@ -57,9 +57,9 @@ DeepSeek Harness 移动接入网关的 **Cloudflare Workers 部署形态**:没�
    |---|---|---|
    | `JWT_SECRET` | secret | 令牌签名密钥,`openssl rand -hex 32`,必填 |
    | `ADMIN_KEY` | secret | 管理密钥(Mac 侧配对凭它),`openssl rand -hex 32`,必填 |
-   | `CF_ACCESS_CLIENT_SECRET` | secret | 可选;Access service token 的 SECRET 半对 |
+   | `CF_ACCESS_CLIENT_SECRET` | secret | **必填**;Access service token 的 SECRET 半对(缺失 = 网关拒绝配对与中转) |
    | `TUNNEL_HOST` | var | cloudflared 隧道公网主机名,如 `mac.example.com`,必填 |
-   | `CF_ACCESS_CLIENT_ID` | var | 可选;Access service token 的 ID 半对 |
+   | `CF_ACCESS_CLIENT_ID` | var | **必填**;Access service token 的 ID 半对 |
    | `MAX_UPLOAD_BYTES` | var | 单请求体积上限,默认 100MiB(见下方「限制」) |
 
 3. 绑自定义域名:Dashboard → Worker → Settings → Domains & Routes → 添加
@@ -82,12 +82,13 @@ cloudflared 隧道,Public Hostname 指向本机 dsh:
 Mac 上安装:`cloudflared service install <隧道 token>`(或用
 [dsh-mobile](https://github.com/iptton-ai/dsh-mobile) 插件托管隧道生命周期)。
 
-## 可选加固:用 Cloudflare Access 保护隧道主机名
+## 必配:用 Cloudflare Access 锁住隧道主机名(2026-08-16 起 fail-closed)
 
 隧道主机名(如 `mac.example.com`)是公开 URL——谁知道域名谁就能**绕过网关直连
-dsh**,且 cloudflared 的本机回环连接恰好满足 dsh 信任围栏,等于拿到完整本地特权。
-默认仅靠「长随机子域名不可猜测」防护;建议用 Access(Zero Trust 免费档)上锁,
-让全世界只有本 Worker 能访问隧道:
+dsh**,且 cloudflared 的本机回环连接恰好满足 dsh 信任围栏,等于拿到完整本地特权
+(实测:无凭证 curl 直达 200)。因此 Access 凭证(ID/SECRET)是**必填项**:
+缺失时网关拒绝配对与中转,`/healthz` 的 `access_protected` 如实上报。这对应
+Rust 版隧道落点 loopback 的结构性隔离 —— CF 版必须显式配出等价防线:
 
 1. 打开 [one.dash.cloudflare.com](https://one.dash.cloudflare.com/) →
    **Access → Service Tokens → Create Service Token**;
@@ -124,7 +125,7 @@ node scripts/revoke.mjs <jti>     # 吊销
 | **单请求体积上限** | Cloudflare 代理按账户计划硬顶:Free/Pro **100MB**、Business 200MB、Enterprise 500MB+。聚合大量图片 base64 的请求可能触顶被 413(该 413 由 CF 边缘直接返回,Worker 拦不到);本 Worker 会按 `MAX_UPLOAD_BYTES` 提前给出友好 413,`/healthz` 也上报该值供 App 预检。**经常传大附件请用 Rust 版自建网关。** |
 | DO 免费额度 | SQLite 后端 Durable Object 免费档:10 万请求/天、500 万行读/天、5GB 存储。个人网关绰绰有余。 |
 | WS 空闲超时 | 长连 WebSocket 若长时间无流量,可能被边缘断开;dsh 事件流自带心跳,正常使用不受影响,异常环境请实测。 |
-| 隧道主机名暴露 | 默认仅靠主机名不可猜测性;建议用 Cloudflare Access(service token)保护 `TUNNEL_HOST`,把 token 填进 Worker 变量。 |
+| 隧道主机名暴露 | **必须**配 Cloudflare Access(service token)保护 `TUNNEL_HOST`(fail-closed:缺凭证网关拒绝服务);这是 CF 版补齐 Rust 版 loopback 隔离的等价防线。 |
 | 信任根差异 | 管理面信任根从「服务器 ssh 权限」变为「ADMIN_KEY 密钥」;请用强随机值,泄漏即等于交出配对权(可换 key 后重启配对)。 |
 | 上游升级 | Deploy Button 克隆进你账号的是独立副本;本仓库更新后需自行 `git pull` 触发重部署。 |
 

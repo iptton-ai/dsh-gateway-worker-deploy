@@ -139,7 +139,7 @@ sudo cloudflared service install "$TUNNEL_TOKEN"
 **验证**:`curl -s -o /dev/null -w '%{http_code}\n' https://$TUNNEL_HOST/` → 任何
 HTTP 状态码(404/405 都算通);`000`/超时 = 隧道没起,查 `cloudflared` 日志。
 
-### 阶段 3:Access 加固(推荐,防止隧道域名泄漏后被直连)
+### 阶段 3:Access 加固(必做 —— fail-closed:缺凭证网关拒绝配对与中转,部署不算完成)
 
 ```bash
 # 1) service token(只此一次能看到 client_secret)

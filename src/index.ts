@@ -250,6 +250,7 @@ interface AdminClaimRequest {
 
 async function adminClaim(request: Request, env: Env): Promise<Response> {
   if (!env.ADMIN_KEY) return err(500, "ADMIN_KEY not configured");
+  if (!accessConfigured(env)) return err(503, ACCESS_REQUIRED_ERROR);
   if (!(await adminAuthed(request, env))) return err(401, "Unauthorized");
   const body = await readJson<AdminClaimRequest>(request);
   if (!body) return err(400, "invalid JSON body");
@@ -398,6 +399,17 @@ function upstreamHeaders(env: Env, base: Headers): Headers {
   return headers;
 }
 
+/** CF 形态的硬性安全要求(2026-08-16 起 fail-closed):隧道主机名是公网入口,
+ *  cloudflared 的回环来源 + Host 改写恰好满足 dsh 信任围栏 —— 无 Access 即
+ *  「无鉴权直达 dsh 全特权」(等价 Rust 版隧道落点 loopback 的结构性隔离)。
+ *  缺任一半对 = 配置不完整:拒绝配对与中转,healthz 如实上报。 */
+export function accessConfigured(env: Env): boolean {
+  return Boolean(env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET);
+}
+
+const ACCESS_REQUIRED_ERROR =
+  "gateway misconfigured: CF_ACCESS_CLIENT_ID/SECRET are required (the tunnel hostname is a public entrance to dsh; without Cloudflare Access it is unauthenticated). Create a service token + self-hosted app, then set both variables.";
+
 function maxUploadBytes(env: Env): number {
   return parseInt(env.MAX_UPLOAD_BYTES || "104857600", 10) || 104857600;
 }
@@ -408,6 +420,7 @@ function isWebSocketUpgrade(request: Request): boolean {
 }
 
 async function relay(request: Request, env: Env, device: AuthedDevice): Promise<Response> {
+  if (!accessConfigured(env)) return err(503, ACCESS_REQUIRED_ERROR);
   const upstreamHost = device.tunnelHost || (env.TUNNEL_HOST || "").trim();
   if (!upstreamHost) {
     return err(502, "no tunnel host configured for this token");
@@ -487,7 +500,12 @@ async function healthz(_request: Request, env: Env): Promise<Response> {
       upstreamOk = false;
     }
   }
-  return json({ ok: true, upstream: upstreamOk, max_upload_bytes: maxUploadBytes(env) });
+  return json({
+    ok: true,
+    upstream: upstreamOk,
+    access_protected: accessConfigured(env),
+    max_upload_bytes: maxUploadBytes(env),
+  });
 }
 
 // ── 扫码落地页(与 Rust 版逐字节一致)──────────────────────────────────

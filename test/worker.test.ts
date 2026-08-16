@@ -4,7 +4,7 @@
 import { SELF, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { Registry } from "../src/registry";
-import { accessHeaderValue } from "../src/index";
+import { accessConfigured, accessHeaderValue } from "../src/index";
 
 declare module "cloudflare:test" {
   interface ProvidedEnv {
@@ -12,6 +12,8 @@ declare module "cloudflare:test" {
     JWT_SECRET: string;
     ADMIN_KEY: string;
     TUNNEL_HOST: string;
+    CF_ACCESS_CLIENT_ID: string;
+    CF_ACCESS_CLIENT_SECRET: string;
   }
 }
 
@@ -69,13 +71,21 @@ describe("healthz 与落地页", () => {
     expect(accessHeaderValue("abcd1234")).toBe("abcd1234");
   });
 
-  it("healthz 上报 ok + max_upload_bytes 能力", async () => {
+  it("healthz 上报 ok + max_upload_bytes 能力 + access 状态", async () => {
     const resp = await SELF.fetch("https://example.com/healthz");
     expect(resp.status).toBe(200);
     const body = await resp.json() as Record<string, unknown>;
     expect(body.ok).toBe(true);
     expect(body.max_upload_bytes).toBe(16);
     expect(typeof body.upstream).toBe("boolean");
+    expect(body.access_protected).toBe(true); // 测试环境配置了 Access 半对
+  });
+
+  it("accessConfigured:缺任一半对即 false(fail-closed 的判定基础)", () => {
+    expect(accessConfigured({ CF_ACCESS_CLIENT_ID: "a", CF_ACCESS_CLIENT_SECRET: "b" } as never)).toBe(true);
+    expect(accessConfigured({ CF_ACCESS_CLIENT_ID: "a", CF_ACCESS_CLIENT_SECRET: "" } as never)).toBe(false);
+    expect(accessConfigured({ CF_ACCESS_CLIENT_ID: "", CF_ACCESS_CLIENT_SECRET: "b" } as never)).toBe(false);
+    expect(env.CF_ACCESS_CLIENT_ID).toBeTruthy(); // 测试环境本身已配(claim/relay 用例依赖)
   });
 
   it("扫码落地页为静态 HTML", async () => {

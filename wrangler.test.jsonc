@@ -9,6 +9,8 @@
     "JWT_SECRET": "test-jwt-secret-0123456789abcdef",
     "ADMIN_KEY": "test-admin-key-0123456789abcdef",
     "TUNNEL_HOST": "tunnel.invalid.example",
+    "CF_ACCESS_CLIENT_ID": "test-access-id.access",
+    "CF_ACCESS_CLIENT_SECRET": "test-access-secret-0123456789abcdef",
     "MAX_UPLOAD_BYTES": "16",
     "TOKEN_TTL_DAYS": "30"
   },

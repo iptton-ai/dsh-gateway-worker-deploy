@@ -3,6 +3,8 @@
 JWT_SECRET=
 # 管理密钥:Mac 侧 scripts/pair.mjs 凭它调用 /admin/pair/*(信任根,强随机)。
 ADMIN_KEY=
-# 可选:用 Cloudflare Access 保护隧道主机名时,service token 的 SECRET 半对
-# (ID 半对填在 wrangler.jsonc 的 vars 里)。不用 Access 就留空。
+# 必填:Cloudflare Access service token 的 SECRET 半对(获取:
+# one.dash.cloudflare.com → Access → Service Tokens → Create;ID 半对填
+# wrangler.jsonc 的 vars)。缺失 = 网关拒绝配对与中转(fail-closed)——
+# 隧道主机名是公网入口,无 Access 即无鉴权直达 dsh。
 CF_ACCESS_CLIENT_SECRET=
