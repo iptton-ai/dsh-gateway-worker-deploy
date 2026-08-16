@@ -127,7 +127,12 @@ curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/
   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H 'content-type: application/json' \
   -d "{\"type\":\"CNAME\",\"proxied\":true,\"name\":\"$TUNNEL_HOST\",\"content\":\"$TUNNEL_ID.cfargotunnel.com\"}" | grep '"success":true'
 
-# 4) Mac 上跑起来(sudo 装系统服务;不想 sudo 就 brew services start cloudflared + config)
+# 4) Mac 上跑起来:
+#    · 用 dsh-mobile 插件(CF 形态)的用户:跳过本步!隧道由插件随 dsh web 拉起,
+#      只需把 cloudflared 换成本地管理形态(凭证落 ~/.cloudflared/<id>.json):
+#      cloudflared tunnel login && cloudflared tunnel create dsh-gateway #        && cloudflared tunnel route dns dsh-gateway $TUNNEL_HOST
+#      然后在插件 config 填 cfTunnelId=<新 UUID> + cfHostname=$TUNNEL_HOST。
+#    · 不用插件:sudo 装系统服务(隧道常驻,与 dsh 是否在跑无关)
 sudo cloudflared service install "$TUNNEL_TOKEN"
 ```
 
