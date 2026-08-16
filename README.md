@@ -140,6 +140,11 @@ node scripts/revoke.mjs <jti>     # 吊销
 | 大陆访问质量 | 取决于域名与边缘调度 | 服务器在哪就在哪 |
 | 适合 | 无服务器个人用户、海外链路 | 自有 VPS、大附件、完全自控 |
 
+## 运维参考
+
+配置项总表、UI/命令行双方案、凭证边界(🔑 标注需你提供 API Token 或
+浏览器授权之处):[docs/OPERATIONS.md](docs/OPERATIONS.md)。
+
 ## 开发
 
 ```bash
