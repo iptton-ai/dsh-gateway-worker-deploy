@@ -135,6 +135,8 @@ interface PairStartRequest {
   code: string;
   secret: string;
   device?: string;
+  /** 租户锚定(QR 邀请 t= 参数;空 = 开放配对)。 */
+  tenant?: string;
 }
 
 async function pairStart(request: Request, env: Env): Promise<Response> {
@@ -151,6 +153,16 @@ async function pairStart(request: Request, env: Env): Promise<Response> {
   if (!validSecret(body.secret ?? "")) {
     return err(400, "secret must be 32-128 alphanumerics");
   }
+  // 租户锚定:必须是活跃租户(存在性与 QR 里的 t= 同为公开事实)。
+  const tenant = (body.tenant ?? "").trim().toLowerCase();
+  if (tenant) {
+    if (tenant === DEFAULT_TENANT || !/^[a-z0-9-]{4,32}$/.test(tenant)) {
+      return err(400, "invalid tenant");
+    }
+    if (!(await registry(env).tenantById(tenant))) {
+      return err(400, "unknown tenant");
+    }
+  }
   const id = crypto.randomUUID();
   const inserted = await registry(env).pairingInsert(
     id,
@@ -158,6 +170,7 @@ async function pairStart(request: Request, env: Env): Promise<Response> {
     body.secret,
     body.device ?? "",
     PAIRING_TTL_SECS,
+    tenant,
   );
   if (!inserted) return err(409, "code already in use; generate a new one");
   return json({ pairing_id: id, expires_at: nowSec() + PAIRING_TTL_SECS });
@@ -178,14 +191,18 @@ async function pairPoll(request: Request, env: Env): Promise<Response> {
     return json({ status: "expired", offers: [] });
   }
   if (p.status === "confirmed") return json({ status: "confirmed", offers: [] });
-  const offers = (await registry(env).claimsFor(p.code_d)).map((c: ClaimRow) => ({
-    claim_id: c.id,
-    host_code: c.host_code,
-    host_label: c.host_label,
-    upstream_port: null,
-    tunnel_host: c.tunnel_host,
-    expires_at: c.expires_at,
-  }));
+  const claims = await registry(env).claimsFor(p.code_d);
+  // 锚定配对只显示该租户的 offers;开放配对('')显示全部。
+  const offers = claims
+    .filter((c: ClaimRow) => !p.tenant_id || c.tenant_id === p.tenant_id)
+    .map((c: ClaimRow) => ({
+      claim_id: c.id,
+      host_code: c.host_code,
+      host_label: c.host_label,
+      upstream_port: null,
+      tunnel_host: c.tunnel_host,
+      expires_at: c.expires_at,
+    }));
   return json({ status: offers.length ? "offers" : "waiting", offers });
 }
 
@@ -214,6 +231,10 @@ async function pairConfirm(request: Request, env: Env): Promise<Response> {
   if (claim.pairing_code !== p.code_d || claim.status !== "offered") {
     return err(400, "claim not applicable");
   }
+  // 锚定配对的深度防御:应约方租户必须与锚定一致。
+  if (p.tenant_id && claim.tenant_id !== p.tenant_id) {
+    return err(400, "claim not applicable");
+  }
   if (claim.expires_at < nowSec()) return err(400, "claim expired");
   const echo = normalizeCode(body.host_code ?? "");
   if (echo !== claim.host_code) return err(400, "host code mismatch");
@@ -227,18 +248,57 @@ async function pairConfirm(request: Request, env: Env): Promise<Response> {
   const ttlDays = parseInt(env.TOKEN_TTL_DAYS || "30", 10) || 30;
   const exp = now + ttlDays * 86400;
   const token = await signJwt({ sub: "dsh-client", jti, device: p.device, iat: now, exp }, env.JWT_SECRET);
-  await registry(env).tokenInsert(jti, p.device, claim.tunnel_host, claim.host_label);
-  return json({ token, expires_at: exp, host_label: claim.host_label });
+  await registry(env).tokenInsert(jti, p.device, claim.tunnel_host, claim.host_label, claim.tenant_id);
+  return json({
+    token,
+    expires_at: exp,
+    host_label: claim.host_label,
+    // 来源宿主稳定标识(CF 形态 = 隧道主机名):App 主机簿复合键用。
+    host_ref: claim.tunnel_host,
+  });
 }
 
-// ── 管理面(ADMIN_KEY;Rust 版为服务器 loopback + ssh)─────────────────
+// ── 管理面(ADMIN_KEY = 运营者超管;tenants 表密钥 = 租户围栏)───────────
 
-async function adminAuthed(request: Request, env: Env): Promise<boolean> {
-  if (!env.ADMIN_KEY) return false;
-  const bearer = request.headers.get("Authorization")?.startsWith("Bearer ")
-    ? request.headers.get("Authorization")!.slice(7)
-    : request.headers.get("X-Admin-Key");
-  return !!bearer && timingSafeEqual(bearer, env.ADMIN_KEY);
+/** 隐式运营者租户 id(不出现在 tenants 表)。 */
+const DEFAULT_TENANT = "default";
+
+interface TenantCtx {
+  id: string;
+  operator: boolean;
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function adminBearer(request: Request): string | null {
+  const auth = request.headers.get("Authorization");
+  if (auth?.startsWith("Bearer ")) return auth.slice(7);
+  return request.headers.get("X-Admin-Key");
+}
+
+/** 管理密钥解析 → 租户上下文:
+ *  - env.ADMIN_KEY(常数时间比较)= 运营者超管(跨租户,可管理租户/宿主);
+ *  - tenants 表登记密钥(sha256 hex)= 显式租户,全部围栏在本租户;
+ *  - 无租户登记的部署只认 env.ADMIN_KEY,行为与多租户改造前一致。 */
+async function adminContext(request: Request, env: Env): Promise<TenantCtx | null> {
+  const bearer = adminBearer(request);
+  if (!bearer) return null;
+  if (env.ADMIN_KEY && timingSafeEqual(bearer, env.ADMIN_KEY)) {
+    return { id: DEFAULT_TENANT, operator: true };
+  }
+  const hash = await sha256Hex(bearer);
+  const tenant = await registry(env).tenantByKey(hash);
+  return tenant ? { id: tenant.id, operator: false } : null;
+}
+
+/** 生成租户管理密钥(32 字节随机 → 64 hex 字符)。 */
+function generateTenantKey(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 interface AdminClaimRequest {
@@ -251,7 +311,11 @@ interface AdminClaimRequest {
 async function adminClaim(request: Request, env: Env): Promise<Response> {
   if (!env.ADMIN_KEY) return err(500, "ADMIN_KEY not configured");
   if (!accessConfigured(env)) return err(503, ACCESS_REQUIRED_ERROR);
-  if (!(await adminAuthed(request, env))) return err(401, "Unauthorized");
+  if (!(await registry(env).rateAllow("admin", clientIp(request), 300, 300))) {
+    return err(429, "too many admin requests, retry later");
+  }
+  const ctx = await adminContext(request, env);
+  if (!ctx) return err(401, "Unauthorized");
   const body = await readJson<AdminClaimRequest>(request);
   if (!body) return err(400, "invalid JSON body");
   const code = normalizeCode(body.code ?? "");
@@ -266,9 +330,28 @@ async function adminClaim(request: Request, env: Env): Promise<Response> {
   // 必须有手机在等这个码(不创建悬空 offer)。
   const pending = await registry(env).pairingByCode(code);
   if (!pending) return err(404, "no phone waiting with this code");
+  // 租户锚定:租户 ctx 对锚定别家的配对按「无人在等」拒(不给探测面);
+  // 运营者跟随锚定(无锚定 = default)。
+  const ctxTenant = ctx.operator
+    ? pending.tenant_id || DEFAULT_TENANT
+    : ctx.id;
+  if (!ctx.operator && pending.tenant_id && pending.tenant_id !== ctx.id) {
+    return err(404, "no phone waiting with this code");
+  }
+  // 宿主归属仲裁:登记过的隧道主机名必须归属本租户且启用;未登记的仅
+  // 运营者/default 放行(单运营者旧语义),显式租户必须先登记。
+  const host = await registry(env).hostByTunnelHost(tunnelHost);
+  if (host) {
+    if (!host.enabled) return err(403, "host disabled");
+    if (host.tenant_id !== ctxTenant) {
+      return err(403, "tunnel host owned by another host");
+    }
+  } else if (!ctx.operator && ctxTenant !== DEFAULT_TENANT) {
+    return err(403, "no host registered for this tunnel host; ask the operator to register it");
+  }
   const id = crypto.randomUUID();
   const hostLabel = (body.host_label || "mac").slice(0, 32);
-  await registry(env).claimInsert(id, code, hostCode, hostLabel, tunnelHost, CLAIM_TTL_SECS);
+  await registry(env).claimInsert(id, code, hostCode, hostLabel, tunnelHost, CLAIM_TTL_SECS, ctxTenant);
   return json({
     claim_id: id,
     device: pending.device,
@@ -279,35 +362,45 @@ async function adminClaim(request: Request, env: Env): Promise<Response> {
 }
 
 async function adminStatus(request: Request, env: Env): Promise<Response> {
-  if (!(await adminAuthed(request, env))) return err(401, "Unauthorized");
+  const ctx = await adminContext(request, env);
+  if (!ctx) return err(401, "Unauthorized");
   const code = normalizeCode(new URL(request.url).searchParams.get("code") ?? "");
   if (!code) return err(400, "code required");
   const found = await registry(env).pairingStatusWithToken(code);
   if (!found) return err(404, "no pairing with this code");
   const { pairing, token } = found;
+  if (!ctx.operator && pairing.tenant_id && pairing.tenant_id !== ctx.id) {
+    return err(404, "no pairing with this code");
+  }
+  const scoped = token && (ctx.operator || token.tenant_id === ctx.id) ? token : null;
   return json({
     status: pairing.status,
     device: pairing.device,
     confirmed: pairing.status === "confirmed",
-    token: token
+    token: scoped
       ? {
-          jti: token.jti,
-          device: token.device,
-          host_label: token.host_label,
-          upstream_port: token.upstream_port,
-          tunnel_host: token.tunnel_host,
-          revoked: token.revoked,
-          created_at: token.created_at,
+          jti: scoped.jti,
+          device: scoped.device,
+          host_label: scoped.host_label,
+          upstream_port: scoped.upstream_port,
+          tunnel_host: scoped.tunnel_host,
+          host_ref: scoped.tunnel_host,
+          tenant_id: scoped.tenant_id,
+          revoked: scoped.revoked,
+          created_at: scoped.created_at,
         }
       : null,
   });
 }
 
 async function adminRevokeToken(request: Request, env: Env): Promise<Response> {
-  if (!(await adminAuthed(request, env))) return err(401, "Unauthorized");
+  const ctx = await adminContext(request, env);
+  if (!ctx) return err(401, "Unauthorized");
   const body = await readJson<{ jti: string }>(request);
   if (!body) return err(400, "invalid JSON body");
-  const revoked = await registry(env).revoke(body.jti ?? "");
+  const revoked = ctx.operator
+    ? await registry(env).revoke(body.jti ?? "")
+    : await registry(env).revokeInTenant(body.jti ?? "", ctx.id);
   return json({ revoked });
 }
 
@@ -318,17 +411,23 @@ function withConnected(rows: Awaited<ReturnType<Registry["tokens"]>>) {
   const cutoff = nowSec() - 300;
   return rows.map((t) => ({
     ...t,
+    host_ref: t.tunnel_host,
     connected: !t.revoked && t.last_used_at !== null && t.last_used_at > cutoff,
   }));
 }
 
 async function adminTokens(request: Request, env: Env): Promise<Response> {
-  if (!(await adminAuthed(request, env))) return err(401, "Unauthorized");
-  return json(withConnected(await registry(env).tokens()));
+  const ctx = await adminContext(request, env);
+  if (!ctx) return err(401, "Unauthorized");
+  const rows = ctx.operator
+    ? await registry(env).tokens()
+    : await registry(env).tokensForTenant(ctx.id);
+  return json(withConnected(rows));
 }
 
 async function adminQr(request: Request, env: Env): Promise<Response> {
-  if (!(await adminAuthed(request, env))) return err(401, "Unauthorized");
+  const ctx = await adminContext(request, env);
+  if (!ctx) return err(401, "Unauthorized");
   const body = await readJson<{ text: string }>(request);
   const text = (body?.text ?? "").trim();
   if (!text || text.length > 512) return err(400, "text must be 1-512 bytes");
@@ -339,12 +438,72 @@ async function adminQr(request: Request, env: Env): Promise<Response> {
   }
 }
 
+// ── 租户/宿主登记(仅运营者 env ADMIN_KEY)─────────────────────────────
+
+async function tenantCreate(request: Request, env: Env): Promise<Response> {
+  const ctx = await adminContext(request, env);
+  if (!ctx?.operator) return err(401, "Unauthorized");
+  const body = await readJson<{ name?: string }>(request);
+  const id = `t-${crypto.randomUUID().slice(0, 8)}`;
+  const key = generateTenantKey();
+  await registry(env).tenantInsert(id, (body?.name ?? "").slice(0, 64), await sha256Hex(key));
+  return json({ id, name: body?.name ?? "", admin_key: key }); // 明文只回显一次
+}
+
+async function tenantList(request: Request, env: Env): Promise<Response> {
+  const ctx = await adminContext(request, env);
+  if (!ctx?.operator) return err(401, "Unauthorized");
+  return json(await registry(env).tenantsList());
+}
+
+async function tenantRevoke(request: Request, env: Env): Promise<Response> {
+  const ctx = await adminContext(request, env);
+  if (!ctx?.operator) return err(401, "Unauthorized");
+  const body = await readJson<{ id: string }>(request);
+  if (!body?.id) return err(400, "id required");
+  if (body.id === DEFAULT_TENANT) return err(400, "cannot revoke the implicit operator tenant");
+  const revoked = await registry(env).tenantSetRevoked(body.id, true);
+  return json({ revoked });
+}
+
+async function hostCreate(request: Request, env: Env): Promise<Response> {
+  const ctx = await adminContext(request, env);
+  if (!ctx?.operator) return err(401, "Unauthorized");
+  const body = await readJson<{ tenant_id?: string; tunnel_host?: string; label?: string }>(request);
+  const tenantId = (body?.tenant_id ?? DEFAULT_TENANT).trim();
+  const tunnelHost = (body?.tunnel_host ?? "").trim();
+  if (!validHostname(tunnelHost)) return err(400, "invalid tunnel_host");
+  if (tenantId !== DEFAULT_TENANT && !(await registry(env).tenantById(tenantId))) {
+    return err(400, "unknown tenant");
+  }
+  const id = `h-${crypto.randomUUID().slice(0, 8)}`;
+  await registry(env).hostInsert(id, tenantId, (body?.label ?? "").slice(0, 64), tunnelHost);
+  return json({ id, tenant_id: tenantId, tunnel_host: tunnelHost });
+}
+
+async function hostList(request: Request, env: Env): Promise<Response> {
+  const ctx = await adminContext(request, env);
+  if (!ctx?.operator) return err(401, "Unauthorized");
+  return json(await registry(env).hostsList());
+}
+
+async function hostRemove(request: Request, env: Env): Promise<Response> {
+  const ctx = await adminContext(request, env);
+  if (!ctx?.operator) return err(401, "Unauthorized");
+  const body = await readJson<{ id: string }>(request);
+  if (!body?.id) return err(400, "id required");
+  const removed = await registry(env).hostRemove(body.id);
+  return json({ removed });
+}
+
 // ── 鉴权(中转与设备管理共用)──────────────────────────────────────────
 
 interface AuthedDevice {
   jti: string;
   device: string;
   tunnelHost: string | null;
+  /** 本令牌归属租户(devices/revoke 围栏键)。 */
+  tenantId: string;
 }
 
 async function authenticate(request: Request, env: Env): Promise<AuthedDevice | Response> {
@@ -355,7 +514,12 @@ async function authenticate(request: Request, env: Env): Promise<AuthedDevice | 
   if (!claims) return err(401, "Unauthorized");
   const route = await registry(env).tokenRoute(claims.jti);
   if (!route.valid) return err(401, "Unauthorized");
-  return { jti: claims.jti, device: claims.device, tunnelHost: route.tunnelHost };
+  return {
+    jti: claims.jti,
+    device: claims.device,
+    tunnelHost: route.tunnelHost,
+    tenantId: route.tenantId,
+  };
 }
 
 // ── 中转(上游 = cloudflared 隧道主机名)───────────────────────────────
@@ -568,7 +732,7 @@ export default {
       return err(403, "password login disabled; use pairing");
     }
 
-    // 管理面:凭 ADMIN_KEY(等价于 Rust 版「有服务器 ssh 权限」的信任根)。
+    // 管理面:凭 ADMIN_KEY(运营者超管)或租户密钥(tenants 表,围栏在本租户)。
     if (path.startsWith("/admin/pair/")) {
       if (request.method === "POST" && path === "/admin/pair/claim") return adminClaim(request, env);
       if (request.method === "GET" && path === "/admin/pair/status") return adminStatus(request, env);
@@ -577,18 +741,27 @@ export default {
       if (request.method === "POST" && path === "/admin/pair/qr") return adminQr(request, env);
       return err(404, "Not Found: /admin/pair/*");
     }
+    // 租户/宿主登记:仅运营者(信任根 = env ADMIN_KEY)。
+    if (request.method === "POST" && path === "/admin/tenants") return tenantCreate(request, env);
+    if (request.method === "GET" && path === "/admin/tenants") return tenantList(request, env);
+    if (request.method === "POST" && path === "/admin/tenants/revoke") return tenantRevoke(request, env);
+    if (request.method === "POST" && path === "/admin/hosts") return hostCreate(request, env);
+    if (request.method === "GET" && path === "/admin/hosts") return hostList(request, env);
+    if (request.method === "POST" && path === "/admin/hosts/remove") return hostRemove(request, env);
 
     // 鉴权面:设备管理 + 全量中转。
     const authed = await authenticate(request, env);
     if (authed instanceof Response) return authed;
     if (request.method === "GET" && path === "/auth/devices") {
-      return json(withConnected(await registry(env).tokens()));
+      // 多租户围栏:只列本租户的设备。
+      return json(withConnected(await registry(env).tokensForTenant(authed.tenantId)));
     }
     if (request.method === "POST" && path === "/auth/revoke") {
       const body = await readJson<{ jti: string }>(request);
       if (!body) return err(400, "invalid JSON body");
-      await registry(env).revoke(body.jti ?? "");
-      return json({ revoked: true });
+      // 只能吊销本租户令牌;跨租户/未知 jti 同样 revoked:false(不给探测面)。
+      const revoked = await registry(env).revokeInTenant(body.jti ?? "", authed.tenantId);
+      return json({ revoked });
     }
     return relay(request, env, authed);
   },

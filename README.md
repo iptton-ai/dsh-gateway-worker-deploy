@@ -156,3 +156,27 @@ npx wrangler dev     # 本地起 Worker(:8787)
 ```
 
 MIT License.
+
+## 多宿主 / 多租户(2026-08-18)
+
+一个 Worker 可服务 **N 台 dsh 宿主**(每台一条 cloudflared 隧道、claim 传
+自己的 `tunnel_host`,令牌逐行绑定 —— README 上文「多机」语义)与 **多个
+租户**(各自拥有互不相交的宿主集合)。旧部署零迁移:没有租户登记时,
+管理面只认 `ADMIN_KEY`(运营者),行为与改造前一致。
+
+- **运营者** = `ADMIN_KEY`(跨租户超管);**显式租户** = tenants 表登记的
+  独立管理密钥(sha256 入库,明文只在创建响应出现一次),同款
+  `/admin/pair/*` 端点但全部围栏在本租户;
+- 运营者端点:`POST /admin/tenants {name}`(建租户出钥)/ `GET /admin/tenants`
+  / `POST /admin/tenants/revoke {id}` / `POST /admin/hosts {tenant_id,
+  tunnel_host}`(宿主登记,隧道主机名全局唯一)/ `GET /admin/hosts` /
+  `POST /admin/hosts/remove {id}`;
+- **宿主归属仲裁**:已登记的 `tunnel_host` 必须归属当前租户,否则 403;
+  未登记的仅运营者放行(单运营者旧语义),显式租户必须先登记;
+- `/auth/devices` / `/auth/revoke` 按令牌租户围栏;`/pair/confirm` 响应新增
+  `host_ref`(= tunnel_host)供 App 主机簿复合键;
+- 配对可带租户锚定(`/pair/start` 的 `tenant` 字段,QR 邀请 `t=` 透传),
+  跨租户 claim 404、poll 只见本租户 offers;
+- 多宿主部署注意:每台宿主的隧道主机名都要建 Access self-hosted 应用,
+  策略 Include 精确引用 service token(多租户下 `any_valid_service_token`
+  会跨租户放行,勿用)。

@@ -16,6 +16,8 @@ export interface PairingRow {
   expires_at: number;
   status: string; // pending | confirmed | expired
   token_jti: string;
+  /** 配对锚定的租户('' = 开放;非空 = QR 邀请 t= 锚定,只显示该租户 offers)。 */
+  tenant_id: string;
 }
 
 export interface ClaimRow {
@@ -27,6 +29,8 @@ export interface ClaimRow {
   created_at: number;
   expires_at: number;
   status: string; // offered | consumed | expired
+  /** 应约方租户(令牌签发时继承为 tokens.tenant_id)。 */
+  tenant_id: string;
 }
 
 export interface TokenRow {
@@ -38,6 +42,25 @@ export interface TokenRow {
   upstream_port: number | null;
   host_label: string;
   tunnel_host: string | null;
+  /** 归属租户(旧行迁移为 'default' = 运营者)。 */
+  tenant_id: string;
+}
+
+export interface TenantRow {
+  id: string;
+  name: string;
+  admin_key_hash: string;
+  created_at: number;
+  revoked: boolean;
+}
+
+export interface HostRow {
+  id: string;
+  tenant_id: string;
+  label: string;
+  tunnel_host: string;
+  created_at: number;
+  enabled: boolean;
 }
 
 const SCHEMA = `
@@ -79,7 +102,31 @@ CREATE TABLE IF NOT EXISTS rate_hits (
   ts INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rate ON rate_hits(kind, key, ts);
+CREATE TABLE IF NOT EXISTS tenants (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL DEFAULT '',
+  admin_key_hash TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL,
+  revoked INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS hosts (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL DEFAULT 'default',
+  label TEXT NOT NULL DEFAULT '',
+  tunnel_host TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_hosts_tenant ON hosts(tenant_id, enabled);
 `;
+
+/** 旧 DO 存储升级:幂等补列(workers sqlite 无独立 migration 文件,
+ *  CREATE TABLE IF NOT EXISTS 不会给已存在的表加列)。 */
+const ENSURE_COLUMNS: Array<[string, string, string]> = [
+  ["tokens", "tenant_id", "TEXT NOT NULL DEFAULT 'default'"],
+  ["pairings", "tenant_id", "TEXT NOT NULL DEFAULT ''"],
+  ["claims", "tenant_id", "TEXT NOT NULL DEFAULT 'default'"],
+];
 
 function nowSec(): number {
   return Math.floor(Date.now() / 1000);
@@ -91,6 +138,13 @@ export class Registry extends DurableObject {
   private migrate(): void {
     if (!this.ready) {
       this.ctx.storage.sql.exec(SCHEMA);
+      for (const [table, column, decl] of ENSURE_COLUMNS) {
+        try {
+          this.ctx.storage.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+        } catch {
+          // 列已存在(SQLITE 错误)—— 幂等语义。
+        }
+      }
       this.ready = true;
     }
   }
@@ -113,6 +167,7 @@ export class Registry extends DurableObject {
       expires_at: r.expires_at as number,
       status: r.status as string,
       token_jti: (r.token_jti as string) ?? "",
+      tenant_id: (r.tenant_id as string) ?? "",
     };
   }
 
@@ -126,6 +181,7 @@ export class Registry extends DurableObject {
       created_at: r.created_at as number,
       expires_at: r.expires_at as number,
       status: r.status as string,
+      tenant_id: (r.tenant_id as string) ?? "default",
     };
   }
 
@@ -139,6 +195,28 @@ export class Registry extends DurableObject {
       upstream_port: (r.upstream_port as number | null) ?? null,
       host_label: (r.host_label as string) ?? "",
       tunnel_host: (r.tunnel_host as string | null) ?? null,
+      tenant_id: (r.tenant_id as string) ?? "default",
+    };
+  }
+
+  private tenantRow(r: Record<string, unknown>): TenantRow {
+    return {
+      id: r.id as string,
+      name: (r.name as string) ?? "",
+      admin_key_hash: r.admin_key_hash as string,
+      created_at: r.created_at as number,
+      revoked: (r.revoked as number) !== 0,
+    };
+  }
+
+  private hostRow(r: Record<string, unknown>): HostRow {
+    return {
+      id: r.id as string,
+      tenant_id: (r.tenant_id as string) ?? "default",
+      label: (r.label as string) ?? "",
+      tunnel_host: r.tunnel_host as string,
+      created_at: r.created_at as number,
+      enabled: (r.enabled as number) !== 0,
     };
   }
 
@@ -173,13 +251,14 @@ export class Registry extends DurableObject {
     secret: string,
     device: string,
     ttlSecs: number,
+    tenantId = "",
   ): Promise<boolean> {
     this.migrate();
     this.sweep();
     const now = nowSec();
     this.ctx.storage.sql.exec(
-      `INSERT INTO pairings (id, code_d, secret, device, created_at, expires_at, status)
-       SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'pending'
+      `INSERT INTO pairings (id, code_d, secret, device, created_at, expires_at, status, tenant_id)
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?8
        WHERE NOT EXISTS (
          SELECT 1 FROM pairings WHERE code_d = ?2
          AND (status = 'pending' OR created_at > ?7 - 1800)
@@ -191,6 +270,7 @@ export class Registry extends DurableObject {
       now,
       now + ttlSecs,
       now,
+      tenantId,
     );
     const inserted = this.ctx.storage.sql.exec("SELECT 1 FROM pairings WHERE id = ?1", id);
     for (const _row of inserted) return true;
@@ -250,12 +330,13 @@ export class Registry extends DurableObject {
     hostLabel: string,
     tunnelHost: string,
     ttlSecs: number,
+    tenantId = "default",
   ): Promise<void> {
     this.migrate();
     const now = nowSec();
     this.ctx.storage.sql.exec(
-      `INSERT INTO claims (id, pairing_code, host_code, host_label, tunnel_host, created_at, expires_at, status)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'offered')`,
+      `INSERT INTO claims (id, pairing_code, host_code, host_label, tunnel_host, created_at, expires_at, status, tenant_id)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'offered', ?8)`,
       id,
       pairingCode,
       hostCode,
@@ -263,6 +344,7 @@ export class Registry extends DurableObject {
       tunnelHost,
       now,
       now + ttlSecs,
+      tenantId,
     );
   }
 
@@ -295,15 +377,22 @@ export class Registry extends DurableObject {
 
   // ── tokens ────────────────────────────────────────────────────────
 
-  async tokenInsert(jti: string, device: string, tunnelHost: string, hostLabel: string): Promise<void> {
+  async tokenInsert(
+    jti: string,
+    device: string,
+    tunnelHost: string,
+    hostLabel: string,
+    tenantId = "default",
+  ): Promise<void> {
     this.migrate();
     this.ctx.storage.sql.exec(
-      "INSERT INTO tokens (jti, device, created_at, tunnel_host, host_label) VALUES (?1, ?2, ?3, ?4, ?5)",
+      "INSERT INTO tokens (jti, device, created_at, tunnel_host, host_label, tenant_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
       jti,
       device,
       nowSec(),
       tunnelHost,
       hostLabel,
+      tenantId,
     );
   }
 
@@ -317,18 +406,24 @@ export class Registry extends DurableObject {
     return false;
   }
 
-  /** 中转热路径:一次往返完成 吊销检查 + touch + 上游解析。 */
-  async tokenRoute(jti: string): Promise<{ valid: boolean; tunnelHost: string | null }> {
+  /** 中转热路径:一次往返完成 吊销检查 + touch + 上游解析(含租户)。 */
+  async tokenRoute(
+    jti: string,
+  ): Promise<{ valid: boolean; tunnelHost: string | null; tenantId: string }> {
     this.migrate();
     const cursor = this.ctx.storage.sql.exec(
-      "UPDATE tokens SET last_used_at = ?2 WHERE jti = ?1 AND revoked = 0 RETURNING tunnel_host",
+      "UPDATE tokens SET last_used_at = ?2 WHERE jti = ?1 AND revoked = 0 RETURNING tunnel_host, tenant_id",
       jti,
       nowSec(),
     );
     for (const row of cursor) {
-      return { valid: true, tunnelHost: (row.tunnel_host as string | null) ?? null };
+      return {
+        valid: true,
+        tunnelHost: (row.tunnel_host as string | null) ?? null,
+        tenantId: (row.tenant_id as string) ?? "default",
+      };
     }
-    return { valid: false, tunnelHost: null };
+    return { valid: false, tunnelHost: null, tenantId: "default" };
   }
 
   async tokens(): Promise<TokenRow[]> {
@@ -339,10 +434,124 @@ export class Registry extends DurableObject {
     return cursor.toArray().map((r) => this.tokenRow(r));
   }
 
+  /** 租户围栏清单(/auth/devices 数据源)。 */
+  async tokensForTenant(tenantId: string): Promise<TokenRow[]> {
+    this.migrate();
+    const cursor = this.ctx.storage.sql.exec(
+      "SELECT * FROM tokens WHERE tenant_id = ?1 ORDER BY created_at DESC",
+      tenantId,
+    );
+    return cursor.toArray().map((r) => this.tokenRow(r));
+  }
+
   async revoke(jti: string): Promise<boolean> {
     const cursor = this.ctx.storage.sql.exec(
       "UPDATE tokens SET revoked = 1 WHERE jti = ?1 AND revoked = 0 RETURNING jti",
       jti,
+    );
+    for (const _row of cursor) return true;
+    return false;
+  }
+
+  /** 租户围栏吊销:跨租户/未知 jti 一律 false(不给探测面)。 */
+  async revokeInTenant(jti: string, tenantId: string): Promise<boolean> {
+    const cursor = this.ctx.storage.sql.exec(
+      "UPDATE tokens SET revoked = 1 WHERE jti = ?1 AND revoked = 0 AND tenant_id = ?2 RETURNING jti",
+      jti,
+      tenantId,
+    );
+    for (const _row of cursor) return true;
+    return false;
+  }
+
+  // ── tenants / hosts(多租户)────────────────────────────────────────
+
+  async tenantInsert(id: string, name: string, adminKeyHash: string): Promise<void> {
+    this.migrate();
+    this.ctx.storage.sql.exec(
+      "INSERT INTO tenants (id, name, admin_key_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
+      id,
+      name,
+      adminKeyHash,
+      nowSec(),
+    );
+  }
+
+  async tenantByKey(adminKeyHash: string): Promise<TenantRow | null> {
+    this.migrate();
+    const cursor = this.ctx.storage.sql.exec(
+      "SELECT * FROM tenants WHERE admin_key_hash = ?1 AND revoked = 0",
+      adminKeyHash,
+    );
+    for (const row of cursor) return this.tenantRow(row);
+    return null;
+  }
+
+  async tenantById(id: string): Promise<TenantRow | null> {
+    this.migrate();
+    const cursor = this.ctx.storage.sql.exec(
+      "SELECT * FROM tenants WHERE id = ?1",
+      id,
+    );
+    for (const row of cursor) return this.tenantRow(row);
+    return null;
+  }
+
+  async tenantsList(): Promise<Omit<TenantRow, "admin_key_hash">[]> {
+    this.migrate();
+    const cursor = this.ctx.storage.sql.exec(
+      "SELECT * FROM tenants ORDER BY created_at",
+    );
+    return cursor.toArray().map((r) => {
+      const { admin_key_hash: _hash, ...rest } = this.tenantRow(r);
+      return rest;
+    });
+  }
+
+  async tenantSetRevoked(id: string, revoked: boolean): Promise<boolean> {
+    const cursor = this.ctx.storage.sql.exec(
+      "UPDATE tenants SET revoked = ?2 WHERE id = ?1 RETURNING id",
+      id,
+      revoked ? 1 : 0,
+    );
+    for (const _row of cursor) return true;
+    return false;
+  }
+
+  async hostInsert(id: string, tenantId: string, label: string, tunnelHost: string): Promise<void> {
+    this.migrate();
+    this.ctx.storage.sql.exec(
+      "INSERT INTO hosts (id, tenant_id, label, tunnel_host, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+      id,
+      tenantId,
+      label,
+      tunnelHost,
+      nowSec(),
+    );
+  }
+
+  async hostByTunnelHost(tunnelHost: string): Promise<HostRow | null> {
+    this.migrate();
+    const cursor = this.ctx.storage.sql.exec(
+      "SELECT * FROM hosts WHERE tunnel_host = ?1",
+      tunnelHost,
+    );
+    for (const row of cursor) return this.hostRow(row);
+    return null;
+  }
+
+  async hostsList(): Promise<HostRow[]> {
+    this.migrate();
+    const cursor = this.ctx.storage.sql.exec(
+      "SELECT * FROM hosts ORDER BY tunnel_host",
+    );
+    return cursor.toArray().map((r) => this.hostRow(r));
+  }
+
+  async hostRemove(id: string): Promise<boolean> {
+    const cursor = this.ctx.storage.sql.exec(
+      "DELETE FROM hosts WHERE id = ?1 RETURNING id",
+      id,
     );
     for (const _row of cursor) return true;
     return false;

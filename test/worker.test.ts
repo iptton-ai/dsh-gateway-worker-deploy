@@ -387,3 +387,183 @@ describe("鉴权与中转", () => {
     expect(after.status).toBe(401);
   });
 });
+
+describe("多租户(tenants/hosts 登记 + 租户密钥围栏)", () => {
+  const OP_KEY = "test-admin-key-0123456789abcdef";
+
+  async function createTenant(name: string): Promise<{ id: string; key: string }> {
+    const resp = await SELF.fetch("https://example.com/admin/tenants", {
+      method: "POST",
+      headers: baseHeaders(OP_KEY),
+      body: JSON.stringify({ name }),
+    });
+    expect(resp.status).toBe(200);
+    const v = (await resp.json()) as { id: string; admin_key: string };
+    return { id: v.id, key: v.admin_key };
+  }
+
+  async function registerHost(tenantId: string, tunnelHost: string) {
+    const resp = await SELF.fetch("https://example.com/admin/hosts", {
+      method: "POST",
+      headers: baseHeaders(OP_KEY),
+      body: JSON.stringify({ tenant_id: tenantId, tunnel_host: tunnelHost, label: "mac" }),
+    });
+    return resp;
+  }
+
+  async function tenantClaim(key: string, code: string, hostCode: string, tunnelHost: string) {
+    return SELF.fetch("https://example.com/admin/pair/claim", {
+      method: "POST",
+      headers: baseHeaders(key),
+      body: JSON.stringify({ code, host_code: hostCode, host_label: "t-mac", tunnel_host: tunnelHost }),
+    });
+  }
+
+  async function fullPair(opts: { tenant?: string; claimKey: string; tunnelHost: string }) {
+    const code = genCode();
+    const startResp = await SELF.fetch("https://example.com/pair/start", {
+      method: "POST",
+      headers: baseHeaders(),
+      body: JSON.stringify({ code, secret: SECRET, device: "t-phone", ...(opts.tenant ? { tenant: opts.tenant } : {}) }),
+    });
+    expect(startResp.status).toBe(200);
+    const start = (await startResp.json()) as { pairing_id: string };
+    const hostCode = genHostCode();
+    const claimResp = await tenantClaim(opts.claimKey, code, hostCode, opts.tunnelHost);
+    return { code, start, hostCode, claimResp };
+  }
+
+  it("租户密钥拿不到运营者权限;未知钥 401;tenants 管理仅运营者", async () => {
+    const a = await createTenant("alpha");
+    // 租户钥不能建租户/宿主。
+    const t2 = await SELF.fetch("https://example.com/admin/tenants", {
+      method: "POST",
+      headers: baseHeaders(a.key),
+      body: JSON.stringify({ name: "nope" }),
+    });
+    expect(t2.status).toBe(401);
+    // 未知钥 401。
+    const bogus = await tenantClaim("bogus-key-1234567890abcdef", genCode(), genHostCode(), "x.example.com");
+    expect(bogus.status).toBe(401);
+    // 运营者列表可见 alpha。
+    const list = (await (
+      await SELF.fetch("https://example.com/admin/tenants", { headers: baseHeaders(OP_KEY) })
+    ).json()) as Array<{ id: string }>;
+    expect(list.some((t) => t.id === a.id)).toBe(true);
+  });
+
+  it("租户必须登记宿主才能 claim;归属仲裁拒绝别家隧道", async () => {
+    const a = await createTenant("alpha2");
+    const b = await createTenant("beta2");
+    const hostA = "a-tunnel.example.com";
+    expect((await registerHost(a.id, hostA)).status).toBe(200);
+
+    const { code, claimResp } = await fullPair({ claimKey: a.key, tunnelHost: "unregistered.example.com" });
+    expect(claimResp.status).toBe(403); // 未登记宿主
+    const { code: _c2, claimResp: c2 } = await fullPair({ claimKey: b.key, tunnelHost: hostA });
+    expect(c2.status).toBe(403); // 归属 alpha,beta 不能用
+    const { code: _c3, start, hostCode, claimResp: c3 } = await fullPair({ claimKey: a.key, tunnelHost: hostA });
+    expect(c3.status).toBe(200);
+    // 运营者用已登记归属 alpha 的隧道(开放配对)→ 403。
+    const opResp = await SELF.fetch("https://example.com/admin/pair/claim", {
+      method: "POST",
+      headers: baseHeaders(OP_KEY),
+      body: JSON.stringify({ code: _c3, host_code: genHostCode(), tunnel_host: hostA }),
+    });
+    expect(opResp.status).toBe(403);
+    void code; void start; void hostCode;
+  });
+
+  it("锚定配对:别家 claim 404;devices/revoke 围栏;吊销租户钥即刻失效", async () => {
+    const a = await createTenant("alpha3");
+    const b = await createTenant("beta3");
+    const hostA = "a3.example.com";
+    const hostB = "b3.example.com";
+    await registerHost(a.id, hostA);
+    await registerHost(b.id, hostB);
+
+    // 锚定 alpha 的配对:beta claim → 404。
+    const code = genCode();
+    const startResp = await SELF.fetch("https://example.com/pair/start", {
+      method: "POST",
+      headers: baseHeaders(),
+      body: JSON.stringify({ code, secret: SECRET, device: "p", tenant: a.id }),
+    });
+    expect(startResp.status).toBe(200);
+    const start = (await startResp.json()) as { pairing_id: string };
+    expect((await tenantClaim(b.key, code, genHostCode(), hostB)).status).toBe(404);
+    // 未知租户锚定 → 400。
+    const badAnchor = await SELF.fetch("https://example.com/pair/start", {
+      method: "POST",
+      headers: baseHeaders(),
+      body: JSON.stringify({ code: genCode(), secret: SECRET, device: "p", tenant: "t-nonexist" }),
+    });
+    expect(badAnchor.status).toBe(400);
+
+    // 锚定 alpha 的正路 claim → confirm 拿令牌(走 fullPair,租户锚定生效)。
+    const { start: s2, hostCode: hc2, claimResp: cr2 } = await fullPair({ tenant: a.id, claimKey: a.key, tunnelHost: hostA });
+    expect(cr2.status).toBe(200);
+    const claim2 = (await cr2.json()) as { claim_id: string };
+    const confirm = (await (
+      await SELF.fetch("https://example.com/pair/confirm", {
+        method: "POST",
+        headers: baseHeaders(),
+        body: JSON.stringify({ pairing_id: s2.pairing_id, secret: SECRET, claim_id: claim2.claim_id, host_code: hc2 }),
+      })
+    ).json()) as { token: string; host_ref: string };
+    expect(confirm.host_ref).toBe(hostA);
+
+    // beta 也拿一个令牌(开放配对)。
+    const { start: s3, hostCode: hc3, claimResp: cr3 } = await fullPair({ claimKey: b.key, tunnelHost: hostB });
+    const claim3 = (await cr3.json()) as { claim_id: string };
+    const confirmB = (await (
+      await SELF.fetch("https://example.com/pair/confirm", {
+        method: "POST",
+        headers: baseHeaders(),
+        body: JSON.stringify({ pairing_id: s3.pairing_id, secret: SECRET, claim_id: claim3.claim_id, host_code: hc3 }),
+      })
+    ).json()) as { token: string };
+
+    // devices 围栏:alpha 令牌只见 alpha 的。
+    const devices = (await (
+      await SELF.fetch("https://example.com/auth/devices", { headers: baseHeaders(confirm.token) })
+    ).json()) as Array<{ tenant_id: string }>;
+    expect(devices.length).toBe(1);
+    expect(devices[0].tenant_id).toBe(a.id);
+
+    // 跨租户 revoke 无效;本租户 revoke 成功。
+    const jtiB = decodeJwtPayload(confirmB.token).jti as string;
+    const cross = (await (
+      await SELF.fetch("https://example.com/auth/revoke", {
+        method: "POST",
+        headers: baseHeaders(confirm.token),
+        body: JSON.stringify({ jti: jtiB }),
+      })
+    ).json()) as { revoked: boolean };
+    expect(cross.revoked).toBe(false);
+    const jtiA = decodeJwtPayload(confirm.token).jti as string;
+    const selfRevoke = (await (
+      await SELF.fetch("https://example.com/auth/revoke", {
+        method: "POST",
+        headers: baseHeaders(confirm.token),
+        body: JSON.stringify({ jti: jtiA }),
+      })
+    ).json()) as { revoked: boolean };
+    expect(selfRevoke.revoked).toBe(true);
+
+    // 租户 tokens 清单只列本租户。
+    const tokens = (await (
+      await SELF.fetch("https://example.com/admin/pair/tokens", { headers: baseHeaders(b.key) })
+    ).json()) as Array<{ tenant_id: string }>;
+    expect(tokens.every((t) => t.tenant_id === b.id)).toBe(true);
+
+    // 吊销租户 → 其钥即刻 401。
+    await SELF.fetch("https://example.com/admin/tenants/revoke", {
+      method: "POST",
+      headers: baseHeaders(OP_KEY),
+      body: JSON.stringify({ id: b.id }),
+    });
+    const revokedKey = await SELF.fetch("https://example.com/admin/pair/tokens", { headers: baseHeaders(b.key) });
+    expect(revokedKey.status).toBe(401);
+  });
+});
